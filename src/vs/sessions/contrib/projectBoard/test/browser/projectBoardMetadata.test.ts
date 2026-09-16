@@ -17,6 +17,9 @@ import { IChatSessionsService } from '../../../../../workbench/contrib/chat/comm
 import { ChatAgentLocation, ChatModeKind, ChatPermissionLevel } from '../../../../../workbench/contrib/chat/common/constants.js';
 import { ChatModel, ChatRequestModel, ChatResponseModel, IChatChangeEvent, IChatModelInputState, IChatRequestModelParameters } from '../../../../../workbench/contrib/chat/common/model/chatModel.js';
 import { getProjectBoardSubmittedAt, projectBoardMetadataLimits, ProjectBoardMetadata } from '../../browser/projectBoardMetadata.js';
+import { workbenchInstantiationService } from '../../../../../workbench/test/browser/workbenchTestServices.js';
+import { ChatAgentService, IChatAgentService } from '../../../../../workbench/contrib/chat/common/participants/chatAgents.js';
+import { MockChatService } from '../../../../../workbench/contrib/chat/test/common/chatService/mockChatService.js';
 
 suite('ProjectBoardMetadata', () => {
 	const store = ensureNoDisposablesAreLeakedInTestSuite();
@@ -108,10 +111,12 @@ suite('ProjectBoardMetadata', () => {
 		request.response = response;
 		h.model.lastRequestObs.set(request, undefined);
 		const metadata = h.create();
-		response.setResult({ errorDetails: {
-			message: 'Interrupted',
-			confirmationButtons: [{ label: 'Keep Going', data: { agentHostResumeTurn: true }, resend: true, preserveRequestId: true }],
-		} });
+		response.setResult({
+			errorDetails: {
+				message: 'Interrupted',
+				confirmationButtons: [{ label: 'Keep Going', data: { agentHostResumeTurn: true }, resend: true, preserveRequestId: true }],
+			}
+		});
 		response.complete();
 		assert.strictEqual(metadata.actions.get()?.request, request);
 		assert.strictEqual(metadata.actions.get()?.error?.confirmationButtons?.[0].label, 'Keep Going');
@@ -135,6 +140,38 @@ suite('ProjectBoardMetadata', () => {
 		assert.ok(!Object.hasOwn(metadata.configuration.get()!, 'inputText'));
 		metadata.setIncludeConfiguration(false);
 		assert.strictEqual(metadata.configuration.get(), undefined);
+	});
+
+	test('PB-18 real chat model usage updates credits before a running response completes', () => {
+		const instantiation = workbenchInstantiationService(undefined, store);
+		instantiation.stub(IChatService, new MockChatService());
+		instantiation.stub(IChatAgentService, store.add(instantiation.createInstance(ChatAgentService)));
+		const model = store.add(instantiation.createInstance(ChatModel, undefined, { initialLocation: ChatAgentLocation.Chat, canUseTools: true }));
+		const first = model.addRequest({ text: 'Previous turn', parts: [] }, { variables: [] }, 100);
+		model.acceptResponseProgress(first, { kind: 'usage', promptTokens: 10, completionTokens: 10, copilotCredits: 10, sessionCopilotCredits: 10 });
+		first.response!.complete();
+		const service = new class extends mock<IChatService>() {
+			override acquireExistingSession(): IChatModelReference { return { object: model, dispose() { } }; }
+		}();
+		const sessions = new class extends mock<IChatSessionsService>() {
+			override getMaterializedSessionResource() { return undefined; }
+		}();
+		const metadata = store.add(new ProjectBoardMetadata({ resource: model.sessionResource }, service, new NullLogService(), sessions));
+		metadata.setIncludeCredits(true);
+		assert.strictEqual(metadata.credits.get(), 10);
+		const running = model.addRequest({ text: 'Running turn', parts: [] }, { variables: [] }, 200);
+		for (const cost of [0, 2.5, 2.6]) {
+			model.acceptResponseProgress(running, { kind: 'usage', promptTokens: 10, completionTokens: 10, copilotCredits: cost });
+			assert.strictEqual(metadata.credits.get(), 10 + cost, 'Billing refinements with identical token counts remain reactive');
+			assert.strictEqual(running.response!.isComplete, false);
+		}
+		model.acceptResponseProgress(running, { kind: 'markdownContent', content: { value: 'Still streaming' } });
+		assert.strictEqual(metadata.credits.get(), 12.6, 'Streaming without a usage report must not invent additional cost');
+		running.response!.setSubagentCopilotCredits('child-call', 1);
+		assert.strictEqual(metadata.credits.get(), 13.6);
+		model.acceptResponseProgress(running, { kind: 'usage', promptTokens: 10, completionTokens: 10, copilotCredits: 2.6, sessionCopilotCredits: 15 });
+		assert.strictEqual(metadata.credits.get(), 15, 'Delayed provider totals update without double counting');
+		assert.strictEqual(running.response!.isComplete, false);
 	});
 
 	test('PB-18 credits reuse the session total, update on usage and release subscriptions when hidden', () => {
@@ -401,11 +438,15 @@ suite('ProjectBoardMetadata', () => {
 
 	test('snapshots bound text and safe context while observing variable data changes', () => {
 		const { model, request, create, changed } = setup();
-		const latest = request('x'.repeat(10000), 100, { variableData: { variables: [
-			{ kind: 'generic', id: 'unsafe', name: 'Unsafe', value: URI.parse('command:workbench.action.closeWindow') },
-			{ kind: 'generic', id: 'string', name: 'Not a URI', value: 'file:///guess' },
-			...Array.from({ length: 20 }, (_, index) => ({ kind: 'file' as const, id: String(index), name: `File ${index}`, value: URI.file(`C:\\project\\${index}.ts`) })),
-		] } });
+		const latest = request('x'.repeat(10000), 100, {
+			variableData: {
+				variables: [
+					{ kind: 'generic', id: 'unsafe', name: 'Unsafe', value: URI.parse('command:workbench.action.closeWindow') },
+					{ kind: 'generic', id: 'string', name: 'Not a URI', value: 'file:///guess' },
+					...Array.from({ length: 20 }, (_, index) => ({ kind: 'file' as const, id: String(index), name: `File ${index}`, value: URI.file(`C:\\project\\${index}.ts`) })),
+				]
+			}
+		});
 		model.lastRequestObs.set(latest, undefined);
 		const metadata = create();
 		let publications = 0;
